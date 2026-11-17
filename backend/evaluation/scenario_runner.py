@@ -18,10 +18,9 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from evaluation.scenarios import DEFAULT_DATASET, build_fingerprints, load_dataset, validate_dataset
+from evaluation.scenarios import DEFAULT_DATASET, load_dataset, validate_dataset
 from observability.experiments import observe_case
-from observability.budgets import (EvaluationBudget, EvaluationBudgetExceeded, bind_budget,
-                                   current_budget, mark_budget_error)
+from observability.budgets import bind_budget, current_budget, mark_budget_error
 
 
 async def _await(value):
@@ -375,39 +374,23 @@ class ScenarioRunner:
 
 
 async def _live(args, dataset):
-    from services.runtime import create_runtime, runtime_config_from_env
-    from evaluation.report_store import ReportStore
-    config = runtime_config_from_env()
-    if not config.get('api_key') or config['api_key'].strip().lower() in {'test', 'dummy', 'changeme', 'your-api-key'}:
-        raise ValueError('A configured ANTHROPIC_API_KEY is required for explicit live replay')
-    config['judge_enabled'] = args.judge
-    config['judge_mode'] = getattr(args, 'judge_mode', None) or config.get('judge_mode', 'scores')
-    if config['judge_mode'] not in ('scores', 'explained_v1'):
-        raise ValueError('Invalid Judge mode')
-    judge, client = None, None
-    if args.judge:
-        from anthropic import AsyncAnthropic
-        from evaluation.evaluator import LLMJudge
-        from observability.instrumentation import AnthropicClientProxy
-        client = AnthropicClientProxy(AsyncAnthropic(api_key=config['api_key'], **({'base_url': config['base_url']} if config.get('base_url') else {})))
-        judge_options = {'mode': config['judge_mode']} if config['judge_mode'] != 'scores' else {}
-        judge = LLMJudge(client, config.get('judge_model', config['model']), **judge_options)
-    try:
-        async def factory(**kwargs):
-            return await _await(create_runtime(config, **kwargs))
-        runner = ScenarioRunner(factory, judge=judge)
-        limits = {key: getattr(args, key, None) for key in ('max_model_calls', 'max_model_seconds')}
-        budget = EvaluationBudget(**limits) if any(value is not None for value in limits.values()) else None
-        report = await runner.run(dataset, metadata={'mode': 'live', 'fingerprints': build_fingerprints(dataset, config)}, budget=budget)
-        ReportStore(args.report_dir).save(report)
-        return report
-    finally:
-        if client is not None:
-            await client.close()
+    from services.runtime import runtime_config_from_env
+    from evaluation.report_store import DEFAULT_REPORT_DIR, ReportStore
+    from evaluation.service import (EvaluationOptions, EvaluationService,
+                                    DEFAULT_MAX_MODEL_CALLS, DEFAULT_MAX_MODEL_SECONDS)
+    calls = getattr(args, 'max_model_calls', None)
+    seconds = getattr(args, 'max_model_seconds', None)
+    options = EvaluationOptions(
+        judge_enabled=getattr(args, 'judge', False), judge_mode=getattr(args, 'judge_mode', None),
+        max_model_calls=DEFAULT_MAX_MODEL_CALLS if calls is None else calls,
+        max_model_seconds=DEFAULT_MAX_MODEL_SECONDS if seconds is None else seconds)
+    return await EvaluationService(ReportStore(getattr(args, 'report_dir', DEFAULT_REPORT_DIR))).run_live(
+        dataset, runtime_config_from_env(), options)
 
 
 def main(argv=None):
     from evaluation.report_store import DEFAULT_REPORT_DIR, ReportStore
+    from evaluation.service import DEFAULT_MAX_MODEL_CALLS, DEFAULT_MAX_MODEL_SECONDS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode', choices=('validate', 'live'), default='validate')
     parser.add_argument('--dataset', default=str(DEFAULT_DATASET))
@@ -415,8 +398,8 @@ def main(argv=None):
     parser.add_argument('--judge', action='store_true', help='Explicitly enable model-based semantic grading in live mode')
     parser.add_argument('--judge-mode', choices=('scores', 'explained_v1'), default=None,
                         help='Optional explicit Judge protocol; defaults to ECHOMIND_JUDGE_MODE or scores')
-    parser.add_argument('--max-model-calls', type=int, help='Maximum SDK create attempts, including Judge/profile; internal HTTP retries are not counted')
-    parser.add_argument('--max-model-seconds', type=float, help='Deadline for provider waits and new case starts; initialization/cleanup may take longer')
+    parser.add_argument('--max-model-calls', type=int, default=DEFAULT_MAX_MODEL_CALLS, help='Maximum SDK create attempts (default 200), including Judge/profile; internal HTTP retries are not counted')
+    parser.add_argument('--max-model-seconds', type=float, default=DEFAULT_MAX_MODEL_SECONDS, help='Provider waits/new case starts deadline (default 1200s); initialization/cleanup may take longer')
     parser.add_argument('--limit', type=int, default=5, help='Maximum live cases; defaults to five. Validation always checks all cases.')
     parser.add_argument('--scenario', action='append', default=[], help='Select a scenario group for live replay; repeatable')
     parser.add_argument('--promote-baseline', metavar='RUN_ID', help='Explicitly freeze one archived run')

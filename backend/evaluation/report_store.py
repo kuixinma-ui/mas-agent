@@ -51,7 +51,8 @@ class ReportStore:
                 report = self.load(path.stem)
                 reports.append({name: copy.deepcopy(report.get(name)) for name in
                                 ('run_id', 'timestamp', 'dataset', 'mode', 'status', 'metadata',
-                                 'total', 'passed', 'pass_rate', 'invalid', 'timeout', 'error', 'hard_fail', 'summary')})
+                                 'total', 'passed', 'pass_rate', 'invalid', 'timeout', 'error', 'hard_fail', 'summary',
+                                 'cleanup', 'budget', 'runtime_error')})
             except (ValueError, OSError):
                 continue
         return reports

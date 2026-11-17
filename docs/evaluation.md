@@ -1,6 +1,6 @@
 # 场景评测与上下文实验
 
-入口是工作台顶部的“评测”。先校验场景数据，再显式回放模型；查看失败后修改一个实验因素，用相同场景比较调优前后的结果。
+入口是工作区导航中的“评测”。先校验场景数据，再显式回放模型；查看失败后修改一个实验因素，用相同场景比较调优前后的结果。
 
 ## 三种验证口径
 
@@ -57,6 +57,8 @@ Push-Location backend
 
 `--mode live` 明确授权当前命令调用配置的模型；`--judge` 另启语义裁判。默认最多回放五条；可用 `--limit 120` 或重复 `--scenario <分组>` 明确扩展。省略 Judge 的语义断言记为 invalid，不能显示通过。API/工作台选择 live 时会运行证据 Judge。
 
+网页与场景CLI共用 `EvaluationService`，统一模型/Judge配置、预算、隔离Runtime和报告保存/关闭路径。live默认上限为200次SDK create尝试、1200秒模型等待及新用例起步；Judge与画像也计入，SDK内部HTTP重试不单独计数，初始化/清理可能超过该时间，不代表金额硬上限。CLI用 `--max-model-calls` / `--max-model-seconds` 覆盖；API请求可传同名下划线字段 `max_model_calls` / `max_model_seconds`，必须为正数。API也支持显式 `judge_mode`，默认仍为配置的`scores`，CLI仍需`--judge`才启用裁判。
+
 模型变化实验建议固定 `ECHOMIND_JUDGE_MODEL`，避免裁判同时变化。模型服务需要支持 Anthropic Messages 协议。
 
 ## 可解释Judge与固定回复诊断
@@ -111,13 +113,15 @@ Push-Location backend
 | 路径 | 行为 |
 |---|---|
 | `GET /eval/scenarios` | 场景目录、数据状态、覆盖统计 |
-| `POST /eval/scenarios/run` | 默认 validate；body 可传 mode、scenario、limit |
+| `POST /eval/scenarios/run` | 默认 validate；body 可传 mode、scenario、limit、judge_mode、max_model_calls、max_model_seconds |
 | `GET /eval/runs` | 已保存运行的摘要 |
 | `GET /eval/runs/{run_id}` | 单次完整报告，仅接受安全运行标识 |
 | `POST /eval/compare` | 配对比较两个运行，显式声明变化因素 |
 | `POST /eval/run` | 兼容旧评测入口，现使用隔离 Runtime；该旧入口为显式真实模型评测 |
 
 默认报告目录 `backend/data/eval/scenarios`，可通过 `ECHOMIND_EVAL_REPORT_DIR` 更改。报告只追加、不自动覆盖同名运行；目录已经被 Git 忽略。报告可能包含用于诊断的对话和错误，存储访问控制由部署者提供。
+
+工作台完整报告及运行历史分别展示运行状态、清理状态和异常原因；预算中断、初始化/清理失败、取消均明确标出。任务通过率仍表示原用例成绩，可能与运行失败同时存在。旧报告未记录状态或清理时会显示状态不完整，不推断已成功清理；数据校验仍不产生质量分数。
 
 每个 live 运行生成 `eval_<uuid>` 独立命名空间；每个用例又有独立用户/会话。Redis key、Chroma 知识/记忆/画像、工具缓存、Agent 统计都与线上独立。异步工厂逐步获取资源；中途失败也回滚并报告 rolled_back/rollback_failed。结束时取消遗留画像任务，清理只属于本次运行的资源并关闭客户端；清理失败会在报告中明确记录，不能当作正常完成。
 

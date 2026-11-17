@@ -25,6 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 from services.storage import identity_text
+from evaluation.service import (EvaluationConfigurationError, EvaluationOptions, EvaluationService,
+                                DEFAULT_MAX_MODEL_CALLS, DEFAULT_MAX_MODEL_SECONDS)
 
 load_dotenv()
 
@@ -364,6 +366,13 @@ class EvalRunInput(BaseModel):
     dialog_cases: Optional[List[EvalDialogInput]] = None
 
 
+def _knowledge_base():
+    knowledge = getattr(_runtime, 'knowledge', None)
+    if knowledge is None:
+        raise HTTPException(503, "知识库未初始化")
+    return knowledge
+
+
 @app.post("/knowledge/add", tags=["知识库"])
 async def add_knowledge(body: BatchDocInput):
     """
@@ -381,10 +390,7 @@ async def add_knowledge(body: BatchDocInput):
     }
     ```
     """
-    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
-    if tool is None:
-        raise HTTPException(503, "知识库未初始化")
-    kb = tool.handler.__self__
+    kb = _knowledge_base()
     count = await kb.add_documents_async([{"title": d.title, "content": d.content} for d in body.documents])
     total = await kb.doc_count_async()
     return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": total}
@@ -401,10 +407,7 @@ async def upload_knowledge(file: UploadFile = File(...)):
 
     文件大小限制：10MB
     """
-    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
-    if tool is None:
-        raise HTTPException(503, "知识库未初始化")
-    kb = tool.handler.__self__
+    kb = _knowledge_base()
 
     content = await file.read()
     if len(content) > 10 * 1024 * 1024:
@@ -438,10 +441,7 @@ async def upload_knowledge(file: UploadFile = File(...)):
 @app.get("/knowledge/stats", tags=["知识库"])
 async def knowledge_stats():
     """查看知识库统计信息（文档片段总数）。"""
-    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
-    if tool is None:
-        raise HTTPException(503, "知识库未初始化")
-    kb = tool.handler.__self__
+    kb = _knowledge_base()
     return {"total_chunks": await kb.doc_count_async()}
 
 
@@ -483,6 +483,9 @@ class ScenarioRunInput(BaseModel):
     mode: Literal['validate', 'live'] = 'validate'
     scenario: Optional[str] = None
     limit: int = Field(default=5, ge=1, le=120)
+    judge_mode: Optional[Literal['scores', 'explained_v1']] = None
+    max_model_calls: int = Field(default=DEFAULT_MAX_MODEL_CALLS, ge=1, strict=True)
+    max_model_seconds: float = Field(default=DEFAULT_MAX_MODEL_SECONDS, gt=0, strict=True, allow_inf_nan=False)
     model_config = {'extra': 'forbid'}
 
 
@@ -523,7 +526,6 @@ async def run_scenarios(body: Optional[ScenarioRunInput] = None):
     import copy
     from datetime import datetime, timezone
     from evaluation.scenarios import validate_dataset, build_fingerprints
-    from evaluation.scenario_runner import ScenarioRunner
     from services.runtime import runtime_config_from_env
     from observability.telemetry import get_telemetry
 
@@ -537,9 +539,10 @@ async def run_scenarios(body: Optional[ScenarioRunInput] = None):
         dataset['cases'] = dataset['cases'][:options.limit]
     summary = validate_dataset(dataset)
     config = runtime_config_from_env()
-    config['judge_enabled'] = options.mode == 'live'
-    metadata = {'mode': options.mode, 'fingerprints': build_fingerprints(dataset, config)}
     if options.mode == 'validate':
+        config['judge_enabled'] = False
+        config['judge_mode'] = options.judge_mode or config.get('judge_mode', 'scores')
+        metadata = {'mode': options.mode, 'fingerprints': build_fingerprints(dataset, config)}
         report = {'run_id': uuid.uuid4().hex, 'timestamp': datetime.now(timezone.utc).isoformat(),
                   'dataset': {key: dataset[key] for key in ('id', 'version', 'status')},
                   'mode': 'validate', 'status': 'validated', 'metadata': metadata,
@@ -547,20 +550,12 @@ async def run_scenarios(body: Optional[ScenarioRunInput] = None):
                   'error': 0, 'hard_fail': 0, 'cases': [], 'validation': summary}
     else:
         try:
-            _anthropic_cfg()
-        except RuntimeError as exc:
+            execution = EvaluationOptions(judge_enabled=True, judge_mode=options.judge_mode,
+                                          max_model_calls=options.max_model_calls,
+                                          max_model_seconds=options.max_model_seconds)
+            return await EvaluationService(_report_store(), telemetry=get_telemetry()).run_live(dataset, config, execution)
+        except EvaluationConfigurationError as exc:
             raise HTTPException(503, str(exc)) from exc
-        from evaluation.evaluator import LLMJudge
-        from anthropic import AsyncAnthropic
-        cfg = _anthropic_cfg()
-        from observability.instrumentation import AnthropicClientProxy
-        judge_client = AnthropicClientProxy(AsyncAnthropic(**{key: cfg[key] for key in ('api_key', 'base_url') if cfg.get(key)}))
-        try:
-            judge_options = {'mode': config['judge_mode']} if config.get('judge_mode', 'scores') != 'scores' else {}
-            runner = ScenarioRunner(_isolated_runtime, judge=LLMJudge(judge_client, config['judge_model'], **judge_options), telemetry=get_telemetry())
-            report = await runner.run(dataset, metadata=metadata)
-        finally:
-            await judge_client.close()
     await asyncio.to_thread(_report_store().save, report)
     return report
 

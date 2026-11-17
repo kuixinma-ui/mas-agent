@@ -559,12 +559,13 @@ version 固定为整数 1，confidence 为 0 到 1 的数值；purpose 与 domai
 
     def _cache_key(self, message: str, history: Optional[List[Dict[str, str]]] = None, *,
                    archived_user_messages=None) -> str:
-        payload = {"message": self._clean_text(message)[:200]}
+        # Match the complete cleaned input visible to the classifier.
+        payload = {"message": self._clean_text(message)}
         if history:
             payload["history"] = [
                 {
-                    "role": self._clean_text(item.get("role", ""))[:20],
-                    "content": self._clean_text(item.get("content", ""))[:160],
+                    "role": self._clean_text(item.get("role", "user")),
+                    "content": self._clean_text(item.get("content", "")),
                 }
                 for item in history[-3:]
             ]
@@ -572,7 +573,7 @@ version 固定为整数 1，confidence 为 0 到 1 的数值；purpose 与 domai
         if archived:
             payload['archived_user_messages'] = archived
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _unique(values: List[str]) -> List[str]:
